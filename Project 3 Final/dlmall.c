@@ -9,7 +9,6 @@
 #define FALSE 0
 #define HEAD (sizeof(struct head))
 #define MIN(size) (((size) > 8) ? (size) : 8)
-#define LIMIT(size) (MIN(0) + HEAD + size)
 #define ALIGN 8
 #define ARENA (64 * 1024)
 
@@ -28,6 +27,8 @@ struct head {
 struct head *arena = NULL;
 struct head *flist = NULL;
 
+/* ================= BASIC NAVIGATION ================= */
+
 struct head *after(struct head *block) {
     return (struct head *)((char *)block + HEAD + block->size);
 }
@@ -36,20 +37,17 @@ struct head *before(struct head *block) {
     return (struct head *)((char *)block - block->bsize - HEAD);
 }
 
+/* ================= CREATE ARENA ================= */
+
 struct head *new() {
-    if (arena != NULL) {
-        printf("one arena already allocated\n");
-        return NULL;
-    }
+    if (arena != NULL) return NULL;
 
     struct head *new = mmap(NULL, ARENA, PROT_READ | PROT_WRITE,
                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    if (new == MAP_FAILED) {
-        printf("mmap failed: error %d\n", errno);
-        return NULL;
-    }
 
-    unsigned int size = ARENA - 2 * HEAD;
+    if (new == MAP_FAILED) return NULL;
+
+    int size = ARENA - 2 * HEAD;
 
     new->bfree = FALSE;
     new->bsize = 0;
@@ -70,6 +68,8 @@ struct head *new() {
     return new;
 }
 
+/* ================= FREE LIST ================= */
+
 void insert(struct head *block) {
     block->next = flist;
     block->prev = NULL;
@@ -79,21 +79,47 @@ void insert(struct head *block) {
 }
 
 void detach(struct head *block) {
-    if (block->next != NULL)
+    if (block->next)
         block->next->prev = block->prev;
-    if (block->prev != NULL)
+
+    if (block->prev)
         block->prev->next = block->next;
     else
         flist = block->next;
 }
+
+/* ================= UTIL ================= */
 
 int adjust(int request) {
     int size = ((request + (ALIGN - 1)) / ALIGN) * ALIGN;
     return MIN(size);
 }
 
+/* ================= SPLIT ================= */
+
+struct head *split(struct head *block, int size) {
+    int remaining = block->size - size - HEAD;
+
+    struct head *newblock = (struct head *)((char *)block + HEAD + size);
+
+    newblock->size = remaining;
+    newblock->free = TRUE;
+    newblock->bsize = size;
+    newblock->bfree = FALSE;
+
+    struct head *aft = after(newblock);
+    aft->bsize = remaining;
+
+    block->size = size;
+
+    return newblock;
+}
+
+/* ================= FIND ================= */
+
 struct head *find(int size) {
     struct head *curr = flist;
+
     while (curr != NULL) {
         if (curr->size >= size)
             return curr;
@@ -104,14 +130,54 @@ struct head *find(int size) {
     return flist;
 }
 
+/* ================= MERGE ================= */
+
+struct head *merge(struct head *block) {
+    struct head *aft = after(block);
+
+    /* merge with next */
+    if (aft->free) {
+        detach(aft);
+        block->size += aft->size + HEAD;
+
+        struct head *newaft = after(block);
+        newaft->bsize = block->size;
+    }
+
+    /* merge with previous */
+    if (block->bfree) {
+        struct head *prev = before(block);
+        detach(prev);
+
+        prev->size += block->size + HEAD;
+
+        struct head *aft2 = after(prev);
+        aft2->bsize = prev->size;
+
+        block = prev;
+    }
+
+    return block;
+}
+
+/* ================= ALLOC ================= */
+
 void *dalloc(size_t request) {
     if (request <= 0) return NULL;
+
     int size = adjust(request);
     struct head *block = find(size);
 
     if (block == NULL) return NULL;
 
     detach(block);
+
+    /* split if large */
+    if (block->size >= size + HEAD + 8) {
+        struct head *newblock = split(block, size);
+        insert(newblock);
+    }
+
     block->free = FALSE;
 
     struct head *aft = after(block);
@@ -120,12 +186,19 @@ void *dalloc(size_t request) {
     return HIDE(block);
 }
 
+/* ================= FREE ================= */
+
 void dfree(void *memory) {
-    if (memory != NULL) {
-        struct head *block = MAGIC(memory);
-        struct head *aft = after(block);
-        block->free = TRUE;
-        aft->bfree = TRUE;
-        insert(block);
-    }
+    if (memory == NULL) return;
+
+    struct head *block = MAGIC(memory);
+
+    block->free = TRUE;
+
+    block = merge(block);
+
+    struct head *aft = after(block);
+    aft->bfree = TRUE;
+
+    insert(block);
 }
